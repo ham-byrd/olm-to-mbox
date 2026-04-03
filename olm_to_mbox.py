@@ -25,6 +25,8 @@ import base64
 import re
 import html
 import time
+import glob as globmod
+import signal
 
 
 def progress_bar(current, total, folder_name='', bar_length=40):
@@ -289,6 +291,10 @@ def convert_olm_to_mbox(olm_path, output_dir):
         mbox_path = os.path.join(output_dir, f"{safe_name}.mbox")
 
         print(f"\n  {folder_name} -> {safe_name}.mbox ({len(xml_files)} messages)")
+
+        # Remove stale lock files from previous interrupted runs
+        for lockfile in globmod.glob(mbox_path + '.lock*'):
+            os.remove(lockfile)
 
         mbox = mailbox.mbox(mbox_path)
         mbox.lock()
