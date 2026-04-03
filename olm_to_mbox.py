@@ -29,7 +29,7 @@ import time
 def progress_bar(current, total, folder_name=''):
     """Print a short progress bar that overwrites in place."""
     if current % 50 != 0 and current != total:
-        return  # only update every 50 emails to reduce flicker
+        return
     pct = current / total if total else 0
     filled = int(20 * pct)
     bar = '#' * filled + '-' * (20 - filled)
@@ -44,18 +44,17 @@ progress_bar.start_time = time.time()
 
 
 def parse_olm_address(addr_elem):
-    """Parse an OLM address element into (name, email) tuple."""
+    """Parse an OLM address element into list of (name, email) tuples."""
     if addr_elem is None:
         return None
     address_list = addr_elem.findall('.//emailAddress')
     if address_list:
         results = []
         for a in address_list:
-            # OLM stores addresses as XML attributes, not child text
+            # OLM stores addresses as XML attributes
             name = a.get('OPFContactEmailAddressName', '').strip()
             email = a.get('OPFContactEmailAddressAddress', '').strip()
             if not email:
-                # Fallback: try as child elements
                 name = a.findtext('OPFContactEmailAddressName', '').strip()
                 email = a.findtext('OPFContactEmailAddressAddress', '').strip()
             if email:
@@ -106,6 +105,39 @@ def format_address_list(addresses):
     return ', '.join(parts)
 
 
+def simplify_folder_name(raw_path):
+    """Extract a clean folder name from OLM internal paths.
+
+    OLM paths look like:
+      Local/com.microsoft.__Messages/Outlook.../hbyrd@.../Sent Items/message.xml
+      Accounts/hbyrd@noteslive.vip/com.microsoft.__Messages/Archive/message.xml
+
+    We want just: 'Sent Items', 'Archive', 'Inbox', etc.
+    """
+    parts = raw_path.replace('\\', '/').split('/')
+
+    # Walk backwards to find the meaningful folder name
+    # Skip: message filenames, com.microsoft.* internals, account names, 'Local', 'Accounts', 'Data'
+    skip = {'local', 'accounts', 'data', 'com.microsoft.__messages', 'com.microsoft.__attachments'}
+    for p in reversed(parts):
+        lower = p.lower()
+        if lower in skip:
+            continue
+        if p.startswith('message_') and p.endswith('.xml'):
+            continue
+        if p.endswith('.xml'):
+            continue
+        if '@' in p:  # email address like hbyrd@noteslive.vip
+            continue
+        if p.startswith('Outlook for Mac Archive'):
+            continue
+        if p == '':
+            continue
+        return p
+
+    return 'Other'
+
+
 def xml_to_email(xml_content, attachments_data=None):
     """Convert OLM XML email content to a Python email.message.Message."""
     try:
@@ -122,6 +154,9 @@ def xml_to_email(xml_content, attachments_data=None):
     subject = find_text('OPFMessageCopySubject')
     html_body = find_text('OPFMessageCopyHTMLBody')
     text_body = find_text('OPFMessageCopyBody')
+    # Fallback: use Preview if both body fields are empty
+    if not html_body and not text_body:
+        text_body = find_text('OPFMessageCopyPreview')
     sent_time = find_text('OPFMessageCopySentTime')
     recv_time = find_text('OPFMessageCopyReceivedTime')
     message_id = find_text('OPFMessageCopyMessageID')
@@ -135,6 +170,12 @@ def xml_to_email(xml_content, attachments_data=None):
         sender = root.find('.//OPFMessageCopySenderAddress')
         if sender is not None:
             from_addrs = parse_olm_address(sender)
+
+    # Fallback: use DisplayTo if no structured To addresses
+    if not to_addrs:
+        display_to = find_text('OPFMessageCopyDisplayTo')
+        if display_to:
+            to_addrs = [('', display_to)]
 
     date = parse_olm_date(sent_time) or parse_olm_date(recv_time)
 
@@ -177,11 +218,14 @@ def xml_to_email(xml_content, attachments_data=None):
     else:
         msg['Date'] = formatdate(localtime=True)
 
+    # Add attachments — OLM stores metadata as XML attributes
     if has_attachments and attachments_data:
         for att_elem in attachment_elems:
-            att_name = att_elem.findtext('OPFAttachmentName', '')
-            att_url = att_elem.findtext('OPFAttachmentURL', '')
-            att_mime = att_elem.findtext('OPFAttachmentContentType', 'application/octet-stream')
+            att_name = att_elem.get('OPFAttachmentName', '') or att_elem.findtext('OPFAttachmentName', '')
+            att_url = att_elem.get('OPFAttachmentURL', '') or att_elem.findtext('OPFAttachmentURL', '')
+            att_mime = att_elem.get('OPFAttachmentContentType', '') or att_elem.findtext('OPFAttachmentContentType', 'application/octet-stream')
+            if not att_mime:
+                att_mime = 'application/octet-stream'
 
             if att_url and att_url in attachments_data:
                 att_data = attachments_data[att_url]
@@ -221,54 +265,63 @@ def convert_olm_to_mbox(olm_path, output_dir):
         print("Error: Not a valid .olm (ZIP) file.")
         sys.exit(1)
 
-    # Categorize files by folder
-    email_files = {}   # folder_path -> list of xml filenames
     all_files = zf.namelist()
 
-    # Build a directory index for fast attachment lookup (O(1) instead of O(n))
+    # Build a set of all files for fast attachment URL lookup
     print("Indexing archive...")
-    dir_index = defaultdict(list)  # directory -> list of non-xml files in it
+    all_files_set = set(all_files)
+
+    # Find all email XML files and group by simplified folder name
+    email_files = defaultdict(list)
+    seen_message_ids = defaultdict(set)  # for deduplication
+
     for name in all_files:
-        dirname = os.path.dirname(name)
         if not name.endswith('.xml'):
-            dir_index[dirname].append(name)
+            continue
+        # Skip non-email XMLs
+        lower = name.lower()
+        if any(skip in lower for skip in ['/contacts/', '/calendar/', '/tasks/', '/notes/',
+                                           'categories.xml', '/address book/']):
+            continue
+        if 'message' not in lower and 'messages' not in os.path.dirname(lower):
+            continue
 
-    for name in all_files:
-        if name.endswith('.xml') and '/Data/' in name:
-            lower = name.lower()
-            if any(skip in lower for skip in ['/contacts/', '/calendar/', '/tasks/', '/notes/']):
-                continue
-            parts = name.split('/Data/')
-            if len(parts) >= 2:
-                folder_path = os.path.dirname(parts[1])
-                if not folder_path:
-                    folder_path = 'Root'
-                if folder_path not in email_files:
-                    email_files[folder_path] = []
-                email_files[folder_path].append(name)
-
-    if not email_files:
-        for name in all_files:
-            if name.endswith('.xml'):
-                folder_path = os.path.dirname(name) or 'Root'
-                folder_path = folder_path.replace('/', '_').strip('_')
-                if not folder_path:
-                    folder_path = 'Root'
-                if folder_path not in email_files:
-                    email_files[folder_path] = []
-                email_files[folder_path].append(name)
+        folder = simplify_folder_name(name)
+        email_files[folder].append(name)
 
     if not email_files:
         print("No email XML files found in the archive.")
-        print(f"Archive contains {len(all_files)} files.")
-        if all_files:
-            print("Sample paths:")
-            for f in all_files[:10]:
-                print(f"  {f}")
         sys.exit(1)
 
+    # Deduplicate: OLM often stores two copies of each email
+    # (one under Local/, one under Accounts/). Prefer Accounts/ copies
+    # as they have more complete body content.
+    print("Deduplicating emails...")
+    deduped = {}
+    total_before = 0
+    for folder, xml_list in email_files.items():
+        total_before += len(xml_list)
+        # Sort so Accounts/ paths come first (preferred), Local/ second
+        xml_list.sort(key=lambda x: (0 if x.startswith('Accounts/') else 1, x))
+        unique = []
+        seen = set()
+        for xml_file in xml_list:
+            try:
+                content = zf.read(xml_file).decode('utf-8', errors='replace')
+                m = re.search(r'OPFMessageCopyMessageID[^>]*>([^<]+)<', content)
+                if m:
+                    mid = m.group(1).strip()
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                unique.append(xml_file)
+            except Exception:
+                unique.append(xml_file)
+        deduped[folder] = unique
+
+    email_files = deduped
     total_emails = sum(len(v) for v in email_files.values())
-    print(f"Found {total_emails:,} emails in {len(email_files)} folders.\n")
+    print(f"Found {total_emails:,} unique emails in {len(email_files)} folders (was {total_before:,} before dedup).\n")
 
     converted = 0
     failed = 0
@@ -281,7 +334,6 @@ def convert_olm_to_mbox(olm_path, output_dir):
             safe_name = 'Unknown'
         mbox_path = os.path.join(output_dir, f"{safe_name}.mbox")
 
-        # Clear progress line, print folder header, then progress resumes below
         sys.stdout.write(f'\r{" " * 90}\r')
         print(f"  {folder_name} ({len(xml_files):,} msgs) -> {safe_name}.mbox")
 
@@ -291,16 +343,18 @@ def convert_olm_to_mbox(olm_path, output_dir):
             try:
                 xml_content = zf.read(xml_file).decode('utf-8', errors='replace')
 
-                # Fast attachment lookup using pre-built index
-                email_dir = os.path.dirname(xml_file)
-                local_attachments = {}
-                for att_file in dir_index.get(email_dir, []):
-                    try:
-                        local_attachments[att_file] = zf.read(att_file)
-                    except Exception:
-                        pass
+                # Load attachments referenced by URL in this email
+                referenced = {}
+                root = ET.fromstring(xml_content)
+                for a in root.findall('.//messageAttachment'):
+                    url = a.get('OPFAttachmentURL', '') or a.findtext('OPFAttachmentURL', '')
+                    if url and url in all_files_set:
+                        try:
+                            referenced[url] = zf.read(url)
+                        except Exception:
+                            pass
 
-                email_msg = xml_to_email(xml_content, local_attachments)
+                email_msg = xml_to_email(xml_content, referenced if referenced else None)
                 if email_msg:
                     mbox.add(email_msg)
                     converted += 1
@@ -316,7 +370,6 @@ def convert_olm_to_mbox(olm_path, output_dir):
     elapsed = time.time() - start_time
     mins, secs = divmod(int(elapsed), 60)
 
-    # Clear progress line
     sys.stdout.write(f'\r{" " * 90}\r')
     sys.stdout.flush()
 
