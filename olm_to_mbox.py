@@ -51,8 +51,13 @@ def parse_olm_address(addr_elem):
     if address_list:
         results = []
         for a in address_list:
-            name = a.findtext('OPFContactEmailAddressName', '').strip()
-            email = a.findtext('OPFContactEmailAddressAddress', '').strip()
+            # OLM stores addresses as XML attributes, not child text
+            name = a.get('OPFContactEmailAddressName', '').strip()
+            email = a.get('OPFContactEmailAddressAddress', '').strip()
+            if not email:
+                # Fallback: try as child elements
+                name = a.findtext('OPFContactEmailAddressName', '').strip()
+                email = a.findtext('OPFContactEmailAddressAddress', '').strip()
             if email:
                 results.append((name, email))
         return results
