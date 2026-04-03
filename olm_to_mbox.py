@@ -26,17 +26,18 @@ import re
 import time
 
 
-def progress_bar(current, total, folder_name='', bar_length=30):
-    """Print a progress bar that overwrites in place."""
+def progress_bar(current, total, folder_name=''):
+    """Print a short progress bar that overwrites in place."""
+    if current % 50 != 0 and current != total:
+        return  # only update every 50 emails to reduce flicker
     pct = current / total if total else 0
-    filled = int(bar_length * pct)
-    bar = '#' * filled + '-' * (bar_length - filled)
+    filled = int(20 * pct)
+    bar = '#' * filled + '-' * (20 - filled)
     elapsed = time.time() - progress_bar.start_time
     rate = current / elapsed if elapsed > 0 else 0
     eta = int((total - current) / rate) if rate > 0 else 0
     eta_m, eta_s = divmod(eta, 60)
-    label = folder_name[:20]
-    sys.stdout.write(f'\r  [{bar}] {current:,}/{total:,} ({pct:.1%}) ~{eta_m}m{eta_s:02d}s left  {label}    ')
+    sys.stdout.write(f'\r  [{bar}] {pct:.1%} ~{eta_m}m{eta_s:02d}s')
     sys.stdout.flush()
 
 progress_bar.start_time = time.time()
