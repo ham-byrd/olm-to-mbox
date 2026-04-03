@@ -18,33 +18,34 @@ import xml.etree.ElementTree as ET
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate, formataddr, parsedate_to_datetime
+from email.utils import formatdate, formataddr
 from email import encoders
-from datetime import datetime, timezone
-import base64
+from datetime import datetime
+from collections import defaultdict
 import re
-import html
 import time
-import glob as globmod
-import signal
 
 
-def progress_bar(current, total, folder_name='', bar_length=40):
-    """Print a progress bar to stderr."""
+def progress_bar(current, total, folder_name='', bar_length=30):
+    """Print a progress bar that overwrites in place."""
     pct = current / total if total else 0
     filled = int(bar_length * pct)
-    bar = '█' * filled + '░' * (bar_length - filled)
-    label = folder_name[:25] + '...' if len(folder_name) > 28 else folder_name
-    line = f'\r  [{bar}] {current:,}/{total:,} ({pct:.1%}) {label}'
-    sys.stderr.write(f'{line:<80}')
-    sys.stderr.flush()
+    bar = '#' * filled + '-' * (bar_length - filled)
+    elapsed = time.time() - progress_bar.start_time
+    rate = current / elapsed if elapsed > 0 else 0
+    eta = int((total - current) / rate) if rate > 0 else 0
+    eta_m, eta_s = divmod(eta, 60)
+    label = folder_name[:20]
+    sys.stdout.write(f'\r  [{bar}] {current:,}/{total:,} ({pct:.1%}) ~{eta_m}m{eta_s:02d}s left  {label}    ')
+    sys.stdout.flush()
+
+progress_bar.start_time = time.time()
 
 
 def parse_olm_address(addr_elem):
     """Parse an OLM address element into (name, email) tuple."""
     if addr_elem is None:
         return None
-    # Address elements can contain sub-elements or direct text
     address_list = addr_elem.findall('.//emailAddress')
     if address_list:
         results = []
@@ -54,7 +55,6 @@ def parse_olm_address(addr_elem):
             if email:
                 results.append((name, email))
         return results
-    # Try direct text
     text = addr_elem.text
     if text and '@' in text:
         return [('', text.strip())]
@@ -66,7 +66,6 @@ def parse_olm_date(date_str):
     if not date_str:
         return None
     date_str = date_str.strip()
-    # OLM uses various date formats
     formats = [
         '%Y-%m-%dT%H:%M:%S',
         '%Y-%m-%dT%H:%M:%S%z',
@@ -79,7 +78,6 @@ def parse_olm_date(date_str):
             return datetime.strptime(date_str, fmt)
         except ValueError:
             continue
-    # Try removing fractional seconds
     date_str_clean = re.sub(r'\.\d+', '', date_str)
     for fmt in formats:
         try:
@@ -109,12 +107,7 @@ def xml_to_email(xml_content, attachments_data=None):
     except ET.ParseError:
         return None
 
-    # Handle namespace if present
-    # OLM emails can have different root tags
-    # Try common element names with and without namespace
-
     def find_text(tag):
-        """Find text for a tag, trying with and without common prefixes."""
         elem = root.find(f'.//{tag}')
         if elem is not None and elem.text:
             return elem.text.strip()
@@ -127,27 +120,21 @@ def xml_to_email(xml_content, attachments_data=None):
     recv_time = find_text('OPFMessageCopyReceivedTime')
     message_id = find_text('OPFMessageCopyMessageID')
 
-    # Parse addresses
     from_addrs = parse_olm_address(root.find('.//OPFMessageCopyFromAddresses'))
     to_addrs = parse_olm_address(root.find('.//OPFMessageCopyToAddresses'))
     cc_addrs = parse_olm_address(root.find('.//OPFMessageCopyCCAddresses'))
     bcc_addrs = parse_olm_address(root.find('.//OPFMessageCopyBCCAddresses'))
 
-    # Also try sender address as fallback
     if not from_addrs:
         sender = root.find('.//OPFMessageCopySenderAddress')
         if sender is not None:
             from_addrs = parse_olm_address(sender)
 
-    # Parse date
     date = parse_olm_date(sent_time) or parse_olm_date(recv_time)
 
-    # Find attachment references
     attachment_elems = root.findall('.//messageAttachment')
-
     has_attachments = bool(attachment_elems and attachments_data)
 
-    # Build the email message
     if has_attachments or (html_body and text_body):
         msg = MIMEMultipart('mixed' if has_attachments else 'alternative')
         if html_body and text_body:
@@ -167,7 +154,6 @@ def xml_to_email(xml_content, attachments_data=None):
     else:
         msg = MIMEText('', 'plain', 'utf-8')
 
-    # Set headers
     if subject:
         msg['Subject'] = subject
     if from_addrs:
@@ -185,7 +171,6 @@ def xml_to_email(xml_content, attachments_data=None):
     else:
         msg['Date'] = formatdate(localtime=True)
 
-    # Add attachments
     if has_attachments and attachments_data:
         for att_elem in attachment_elems:
             att_name = att_elem.findtext('OPFAttachmentName', '')
@@ -218,6 +203,11 @@ def convert_olm_to_mbox(olm_path, output_dir):
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # Clean up any stale lock files from previous interrupted runs
+    import glob as globmod
+    for lockfile in globmod.glob(os.path.join(output_dir, '*.lock*')):
+        os.remove(lockfile)
+
     print(f"Opening {olm_path}...")
     try:
         zf = zipfile.ZipFile(olm_path, 'r')
@@ -229,15 +219,19 @@ def convert_olm_to_mbox(olm_path, output_dir):
     email_files = {}   # folder_path -> list of xml filenames
     all_files = zf.namelist()
 
-    # Identify email XML files (they're typically in message folders)
-    # OLM structure: account/Data/FolderName/message.xml or similar
+    # Build a directory index for fast attachment lookup (O(1) instead of O(n))
+    print("Indexing archive...")
+    dir_index = defaultdict(list)  # directory -> list of non-xml files in it
+    for name in all_files:
+        dirname = os.path.dirname(name)
+        if not name.endswith('.xml'):
+            dir_index[dirname].append(name)
+
     for name in all_files:
         if name.endswith('.xml') and '/Data/' in name:
-            # Skip contacts, calendar, etc.
             lower = name.lower()
             if any(skip in lower for skip in ['/contacts/', '/calendar/', '/tasks/', '/notes/']):
                 continue
-            # Extract folder name from path
             parts = name.split('/Data/')
             if len(parts) >= 2:
                 folder_path = os.path.dirname(parts[1])
@@ -248,11 +242,9 @@ def convert_olm_to_mbox(olm_path, output_dir):
                 email_files[folder_path].append(name)
 
     if not email_files:
-        # Fallback: try all XML files
         for name in all_files:
             if name.endswith('.xml'):
                 folder_path = os.path.dirname(name) or 'Root'
-                # Clean up folder path for use as filename
                 folder_path = folder_path.replace('/', '_').strip('_')
                 if not folder_path:
                     folder_path = 'Root'
@@ -270,48 +262,37 @@ def convert_olm_to_mbox(olm_path, output_dir):
         sys.exit(1)
 
     total_emails = sum(len(v) for v in email_files.values())
-    print(f"Found {total_emails} emails in {len(email_files)} folders.")
-
-    # Pre-load attachment data referenced by emails
-    attachment_data = {}
-    for name in all_files:
-        if not name.endswith('.xml'):
-            # Could be an attachment file
-            attachment_data[name] = None  # lazy load marker
+    print(f"Found {total_emails:,} emails in {len(email_files)} folders.\n")
 
     converted = 0
     failed = 0
     start_time = time.time()
+    progress_bar.start_time = start_time
 
     for folder_name, xml_files in sorted(email_files.items()):
-        # Clean folder name for filesystem
         safe_name = re.sub(r'[^\w\s\-.]', '_', folder_name).strip('_')
         if not safe_name:
             safe_name = 'Unknown'
         mbox_path = os.path.join(output_dir, f"{safe_name}.mbox")
 
-        print(f"\n  {folder_name} -> {safe_name}.mbox ({len(xml_files)} messages)")
-
-        # Remove stale lock files from previous interrupted runs
-        for lockfile in globmod.glob(mbox_path + '.lock*'):
-            os.remove(lockfile)
+        # Clear progress line, print folder header, then progress resumes below
+        sys.stdout.write(f'\r{" " * 90}\r')
+        print(f"  {folder_name} ({len(xml_files):,} msgs) -> {safe_name}.mbox")
 
         mbox = mailbox.mbox(mbox_path)
-        mbox.lock()
 
-        for i, xml_file in enumerate(xml_files, 1):
+        for xml_file in xml_files:
             try:
                 xml_content = zf.read(xml_file).decode('utf-8', errors='replace')
 
-                # Load any attachments referenced in this email's directory
+                # Fast attachment lookup using pre-built index
                 email_dir = os.path.dirname(xml_file)
                 local_attachments = {}
-                for name in all_files:
-                    if name.startswith(email_dir) and not name.endswith('.xml'):
-                        try:
-                            local_attachments[name] = zf.read(name)
-                        except Exception:
-                            pass
+                for att_file in dir_index.get(email_dir, []):
+                    try:
+                        local_attachments[att_file] = zf.read(att_file)
+                    except Exception:
+                        pass
 
                 email_msg = xml_to_email(xml_content, local_attachments)
                 if email_msg:
@@ -321,17 +302,17 @@ def convert_olm_to_mbox(olm_path, output_dir):
                     failed += 1
             except Exception as e:
                 failed += 1
-                print(f"\n    Warning: Failed to convert {os.path.basename(xml_file)}: {e}")
 
             progress_bar(converted + failed, total_emails, safe_name)
 
-        mbox.unlock()
         mbox.close()
 
     elapsed = time.time() - start_time
     mins, secs = divmod(int(elapsed), 60)
-    sys.stderr.write('\r' + ' ' * 80 + '\r')
-    sys.stderr.flush()
+
+    # Clear progress line
+    sys.stdout.write(f'\r{" " * 90}\r')
+    sys.stdout.flush()
 
     zf.close()
 
