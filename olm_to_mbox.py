@@ -24,6 +24,18 @@ from datetime import datetime, timezone
 import base64
 import re
 import html
+import time
+
+
+def progress_bar(current, total, folder_name='', bar_length=40):
+    """Print a progress bar to stderr."""
+    pct = current / total if total else 0
+    filled = int(bar_length * pct)
+    bar = '█' * filled + '░' * (bar_length - filled)
+    label = folder_name[:25] + '...' if len(folder_name) > 28 else folder_name
+    line = f'\r  [{bar}] {current:,}/{total:,} ({pct:.1%}) {label}'
+    sys.stderr.write(f'{line:<80}')
+    sys.stderr.flush()
 
 
 def parse_olm_address(addr_elem):
@@ -267,6 +279,7 @@ def convert_olm_to_mbox(olm_path, output_dir):
 
     converted = 0
     failed = 0
+    start_time = time.time()
 
     for folder_name, xml_files in sorted(email_files.items()):
         # Clean folder name for filesystem
@@ -280,7 +293,7 @@ def convert_olm_to_mbox(olm_path, output_dir):
         mbox = mailbox.mbox(mbox_path)
         mbox.lock()
 
-        for xml_file in xml_files:
+        for i, xml_file in enumerate(xml_files, 1):
             try:
                 xml_content = zf.read(xml_file).decode('utf-8', errors='replace')
 
@@ -302,14 +315,21 @@ def convert_olm_to_mbox(olm_path, output_dir):
                     failed += 1
             except Exception as e:
                 failed += 1
-                print(f"    Warning: Failed to convert {os.path.basename(xml_file)}: {e}")
+                print(f"\n    Warning: Failed to convert {os.path.basename(xml_file)}: {e}")
+
+            progress_bar(converted + failed, total_emails, safe_name)
 
         mbox.unlock()
         mbox.close()
 
+    elapsed = time.time() - start_time
+    mins, secs = divmod(int(elapsed), 60)
+    sys.stderr.write('\r' + ' ' * 80 + '\r')
+    sys.stderr.flush()
+
     zf.close()
 
-    print(f"\nDone! Converted {converted} emails, {failed} failed.")
+    print(f"\nDone! Converted {converted:,} emails, {failed:,} failed in {mins}m {secs}s.")
     print(f"Output directory: {output_dir}")
     print(f"\nTo import into Thunderbird:")
     print(f"  1. Install 'ImportExportTools NG' add-on")
